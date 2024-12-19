@@ -20,7 +20,7 @@ ENDOBJECT
 
 OBJECT target OF hash_link
   name:PTR TO CHAR
-  dependencies:PTR TO queue_header
+  dependencies:PTR TO ordered_hash
   actions:PTR TO queue_header
 ENDOBJECT
 
@@ -37,10 +37,6 @@ PROC get_target_key(t:PTR TO target) IS t.name
 PROC compare_target(a:PTR TO target,b:PTR TO target)
 ENDPROC StrCmp(a.name,b.name)
 
-OBJECT dependancy OF queue_node
-  name
-ENDOBJECT
-
 OBJECT action OF queue_node
   command
 ENDOBJECT
@@ -53,9 +49,22 @@ PROC init() OF target_hash
     {get_target_key},{compare_target},{string_hash})
 ENDPROC
 
-OBJECT dependency OF single_list_node
+OBJECT dependency OF hash_link
+  name
   bullseye:PTR TO target
 ENDOBJECT
+
+PROC get_dependency_name(d:PTR TO dependency) IS d.name
+
+PROC compare_dependency(a:PTR TO dependency,b:PTR TO dependency)
+ENDPROC StrCmp(a.name,b.name)
+
+CONST UNINITIALIZED_PTR=-1
+
+PROC init() OF dependency
+  SUPER self.init_base(HASH_NORMAL,
+    {get_dependency_name},{compare_dependency},{string_hash})
+ENDPROC
 
 OBJECT constant OF hash_link
   id:PTR TO CHAR
@@ -76,7 +85,8 @@ PROC init() OF constant_hash
     {get_constant_key},{compare_constant},{string_hash})
 ENDPROC
 
-ENUM ERR_OK,ERR_ACTION,ERR_SUBSTITUTION,ERR_CONSTANT,ERR_PARSE
+ENUM ERR_OK,ERR_ACTION,ERR_SUBSTITUTION,ERR_CONSTANT,ERR_PARSE,
+  ERR_DEEP_NEST
 
 -> Globals
 DEF targets:PTR TO target_hash,
@@ -84,28 +94,35 @@ DEF targets:PTR TO target_hash,
   current_target:PTR TO target,
   start:PTR TO target,
   args:PTR TO arguments,line_buffer,line_buf,
-  file,line_number,parse_actions
+  file,line_number,parse_actions,include_level
 
 PROC is_whitespace(c)
   IF c=' ' OR c='\t' THEN RETURN TRUE
 ENDPROC FALSE
 
-PROC trim()
-  DEF pos:REG
+PROC trim(line)
+  DEF pos:REG,c:REG
 
   -> seek past front space
   pos:=0
-  WHILE is_whitespace(line_buf[pos])
+  LOOP
+    c:=line[pos]
+    IFN is_whitespace(c) THEN EXIT
     INC pos
-  ENDWHILE
-  IF pos>0 THEN line_buf:=MidStr(line_buf,pos)
-ENDPROC
+    -> Return empty string if whole string was whitespace.
+    IF pos=EstrLen(line) THEN RETURN String(0)
+  ENDLOOP
+  IF pos>0 THEN RETURN MidStr(line,pos)
+  -> unchanged line is returned by this point
+ENDPROC line
 
 PROC include_file(filename)
   DEF filebuf:PTR TO file_buffer,old_line,old_file,
     filt:PTR TO filter,split:PTR TO splitter,
     buf:PTR TO buffer,iter:PTR TO iterator
 
+  INC include_level
+  IF include_level>8 THEN Raise(ERR_DEEP_NEST)
   -> load and process build file
   filebuf.load_buffer(filename,TRUE)
   old_file:=file
@@ -139,7 +156,7 @@ PROC parse_line(cstr)
   IF is_whitespace(line_buf[0])
     IF parse_actions=FALSE THEN Raise(ERR_ACTION)
     add_action()
-  ELSEIF StrCmp(line_buf,'#i ',3)
+  ELSEIF StrCmp(line_buf,'#i',2) AND is_whitespace(line_buf[2])
     -> include file
     include_file(trim(MidStr(line_buf,3)))
   ELSE
@@ -150,10 +167,9 @@ ENDPROC
 PROC add_action()
   DEF text,node:PTR TO action_node
 
-  trim()
   substitutions()
   NEW node.init()
-  node.command:=line_buffer
+  node.command:=trim(line_buffer)
   current_target.actions.enqueue(node)
 ENDPROC
 
@@ -176,7 +192,8 @@ ENDPROC
 
 -> recursively substitutes constants within constants
 PROC substitute(cursor,source)
-  DEF left:REG,right:REG,sub,k,node:PTR TO constant,prev:REG
+  DEF left:REG,right:REG,sub,k,node:PTR TO constant,prev:REG,
+    i:PTR TO ordered_hash_iterator
 
   left:=cursor
   IF left>0
@@ -188,7 +205,18 @@ PROC substitute(cursor,source)
   k:=MidStr(source,left,right-left)
   -> check for 'dep' reserved id
   IF StrCmp(k,'dep')
-    StrAdd(line_buffer,current_target.dependancies.get_first())
+    NEW i.init(current_target.dependencies)
+    IF i.next()
+      StrAdd(line_buffer,i.get_current_item())
+    ELSE
+      Raise(ERR_CONSTANT)
+    ENDIF
+    END i
+  -> check for 'target' reserved id
+  ELSEIF StrCmp(k,'target')
+	sub:=get_target_key(current_target)
+	IF sub=NIL THEN Raise(ERR_CONSTANT)
+    StrAdd(line_buffer,sub)
   ELSE
     node:=constants.find(k)
     IF node=NIL THEN Raise(ERR_CONSTANT)
@@ -197,8 +225,8 @@ PROC substitute(cursor,source)
     WHILE left>=0
       prev:=substitute(left,sub)
       left:=InStr(source,'$(',prev)
-	ENDWHILE
-	StrAdd(line_buffer,source,prev)
+    ENDWHILE
+    StrAdd(line_buffer,source,prev)
   ENDIF
 ENDPROC right+1
 
@@ -228,7 +256,8 @@ PROC parse_rule()
       IF EstrLen(name)>0
         NEW d.init()
         d.name:=iter.get_current_value()
-        current_target.dependencies.enqueue(d)
+        d.bullseye:=UNINITIALIZED_PTR
+        current_target.dependencies.add(d)
       ENDIF
     ENDWHILE
     parse_actions:=TRUE
@@ -278,17 +307,17 @@ PROC main() HANDLE
   NEW targets.init()
   NEW constants.init()
   parse_actions:=FALSE
+  include_level:=0
   file:=args.file
   line_number:=0
   -> double buffer for constant substitutions
   line_buffer:=String(4096)
-  line_buf:=String(4096)
+  line_buf:=String(1024)
   
   -> process build file
   include_file(args.file)
 
 EXCEPT
-  IF rdargs THEN FreeArgs(rdargs)
   SELECT exception
     CASE ERR_OK
       IF args.verbose THEN PrintF('Exiting successfully.')
@@ -304,6 +333,8 @@ EXCEPT
     CASE ERR_PARSE
       PrintF('Rule failed to parse.\n'+
         'in file \s line number \d\n',file,line_number)
+    CASE ERR_DEEP_NEST
+      PrintF('Nesting level is \d in file \s.\n',include_level,file)
     CASE "MEM"
       PrintF('Out of memory.\n')
     CASE "OPEN"
@@ -318,6 +349,7 @@ EXCEPT
     DEFAULT
       PrintF('Unhandled exception encountered.\n')
   ENDSELECT
+  IF rdargs THEN FreeArgs(rdargs)
 ENDPROC
 
 version_tag: CHAR 0,'$VER:'
