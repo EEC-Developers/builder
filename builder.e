@@ -6,7 +6,7 @@ OPT OSVERSION=37
 MODULE 'Hash/hashBase','Hash/orderedHash','Hash/unorderedHash',
   'Buffer/bufferBase','Buffer/fileBuffer','Queue/queue',
   'List/singleList','List/listBase','Iterator/iterator',
-  'Filter:filterBase','Filter/splitter',
+  'Filter/filterBase','Filter/splitter',
   'dos/dos','dos/dostags','dos/dosextens'
 
 OBJECT arguments
@@ -140,6 +140,7 @@ PROC include_file(filename)
   ENDWHILE
   file:=old_file
   line_number:=old_line
+  DEC include_level
   END iter,filt,filebuf
 ENDPROC
 
